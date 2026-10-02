@@ -1,0 +1,302 @@
+{
+  "name": "Turbine Alerts → GitHub Status",
+  "nodes": [
+    {
+      "id": "outlook-trigger",
+      "name": "New Alert Email (Outlook)",
+      "type": "n8n-nodes-base.microsoftOutlookTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "output": "raw",
+        "filters": {},
+        "options": {}
+      }
+    },
+    {
+      "id": "imap-trigger",
+      "name": "New Alert Email (IMAP)",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "disabled": true,
+      "parameters": {
+        "mailbox": "Turbine Alerts",
+        "postProcessAction": "read",
+        "options": {}
+      }
+    },
+    {
+      "id": "parse-emails",
+      "name": "Parse Emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ─────────────────────────────────────────────────────────────\n// Parse Emails  (n8n Code node, mode: \"Run Once for All Items\")\n// Parses OpsControl turbine alarm emails into normalised events.\n//\n//   DATE:        2026-10-02 11:41:10\n//   PARK:        Bealhill\n//   Turbine:     4\n//   S/N:          30124\n//   CODE: (-10)\n//   DESCRIPTION: Communication has been lost to the turbine\n// ─────────────────────────────────────────────────────────────\n\nconst CONFIG = {\n  repo: 'YOUR-GITHUB-USER/turbine-status', // owner/repo that GitHub Pages serves\n  branch: 'main',\n  timeZone: 'Europe/Dublin',               // timezone the DATE: field is written in\n};\n\n// PARK name as it appears in the email -> farm id used in users.json / farms.json.\n// Anything not listed is slugified automatically (\"Bealhill\" -> \"bealhill\").\nconst FARM_ALIASES = {\n  // 'Bealhill': 'bealhill',\n};\n\n// OpsControl all-clear: \"CODE: (0)  DESCRIPTION: Turbine OK\"\nconst CLEAR_CODES = ['0'];\nconst CLEAR_RE   = /\\b(turbine ok|cleared?|reset|resolved|back in operation|restored|re-?established|normal operation)\\b/i;\n// DESCRIPTION text that should show amber rather than red\nconst WARNING_RE = /\\b(warning|warn|ice|icing|curtail\\w*)\\b/i;\n\n// ── helpers ──────────────────────────────────────────────────\nconst field = (text, label) => {\n  const m = text.match(new RegExp(`^[ \\\\t]*${label}[ \\\\t]*:[ \\\\t]*(.*)$`, 'im'));\n  return m ? m[1].trim() : null;\n};\nconst slug = s => s.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');\n// HTML -> text, keeping line breaks so the \"LABEL: value\" lines survive\nconst htmlToText = h => (h || '')\n  .replace(/<style[\\s\\S]*?<\\/style>/gi, '')\n  .replace(/<br\\s*\\/?>|<\\/(p|div|tr|li|h\\d)>/gi, '\\n')\n  .replace(/<[^>]+>/g, '')\n  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n  .replace(/\\r/g, '');\nconst dayOf = d => new Intl.DateTimeFormat('en-CA', { timeZone: CONFIG.timeZone }).format(d); // YYYY-MM-DD\n\n// \"2026-10-02 11:41:10\" in Europe/Dublin -> real instant (handles IST/GMT switch)\nfunction localToDate(s) {\n  const m = s && s.match(/(\\d{4})-(\\d{2})-(\\d{2})[ T](\\d{2}):(\\d{2})(?::(\\d{2}))?/);\n  if (!m) return null;\n  const asUtc = Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));\n  const offsetAt = t => {\n    const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {\n      timeZone: CONFIG.timeZone, hourCycle: 'h23',\n      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',\n    }).formatToParts(new Date(t)).map(x => [x.type, x.value]));\n    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - t;\n  };\n  return new Date(asUtc - offsetAt(asUtc - offsetAt(asUtc)));\n}\n\n// ── main ─────────────────────────────────────────────────────\nconst events = [];\n\nfor (const item of $input.all()) {\n  const j = item.json;\n  // Works with the Microsoft Outlook trigger (raw) and the IMAP trigger\n  const subject = j.subject || '';\n  const body = j.textPlain || j.text\n    || htmlToText(j.textHtml || j.html || j.body?.content)\n    || j.bodyPreview || '';\n  const received = new Date(j.receivedDateTime || j.date || Date.now());\n\n  const park    = field(body, 'PARK');\n  const turbine = field(body, 'Turbine')?.match(/\\d+/)?.[0];\n  const alarmAt = localToDate(field(body, 'DATE')) || received;\n\n  if (!park || !turbine) {\n    // Not an alarm we understand: keep a trace in the day's history, never drop silently\n    events.push({ unparsed: true, ts: received.toISOString(), subject: subject.slice(0, 200) });\n    continue;\n  }\n\n  const code = field(body, 'CODE')?.replace(/^\\(\\s*|\\s*\\)$/g, '') || null;   // \"(-10)\" -> \"-10\"\n  const description = field(body, 'DESCRIPTION') || '';\n\n  events.push({\n    ts: alarmAt.toISOString(),\n    farm: FARM_ALIASES[park] || slug(park),\n    farmName: park,\n    turbine: `T${String(parseInt(turbine, 10)).padStart(2, '0')}`,\n    serial: field(body, 'S/N'),\n    type: (CLEAR_CODES.includes(code) || CLEAR_RE.test(description)) ? 'clear'\n        : WARNING_RE.test(description) ? 'warning' : 'fault',\n    code,\n    text: description.slice(0, 200),\n  });\n}\n\nevents.sort((a, b) => a.ts.localeCompare(b.ts));\n\nreturn [{\n  json: {\n    repo: CONFIG.repo,\n    branch: CONFIG.branch,\n    date: dayOf(new Date()),\n    timeZone: CONFIG.timeZone,\n    events,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "has-events",
+      "name": "Has Events?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        460,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.events.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "get-status-file",
+      "name": "Get Status File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        100
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.github.com/repos/{{ $('Parse Emails').first().json.repo }}/contents/data/status.json?ref={{ $('Parse Emails').first().json.branch }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "User-Agent",
+              "value": "n8n-turbine-status"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "get-history-file",
+      "name": "Get History File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        100
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.github.com/repos/{{ $('Parse Emails').first().json.repo }}/contents/data/history/{{ $('Parse Emails').first().json.date }}.json?ref={{ $('Parse Emails').first().json.branch }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "User-Agent",
+              "value": "n8n-turbine-status"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "apply-events",
+      "name": "Apply Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ─────────────────────────────────────────────────────────────\n// Apply Events  (n8n Code node, mode: \"Run Once for All Items\")\n// Reads the current status.json + today's history file from GitHub,\n// applies the new events, and outputs one item per file to commit.\n// ─────────────────────────────────────────────────────────────\n\nconst RULES = {\n  intermittentAlarms: 3, // >= this many alarms (or separate episodes) for one turbine in a day = intermittent\n};\n\nconst parsed  = $('Parse Emails').first().json;\nconst stRes   = $('Get Status File').first().json;\nconst hiRes   = $('Get History File').first().json;\n\nconst decode = r => (r && typeof r.content === 'string')\n  ? JSON.parse(Buffer.from(r.content, 'base64').toString('utf8'))\n  : null;\nconst encode = o => Buffer.from(JSON.stringify(o, null, 2) + '\\n', 'utf8').toString('base64');\nconst dayOf  = iso => new Intl.DateTimeFormat('en-CA', { timeZone: parsed.timeZone }).format(new Date(iso));\nconst idOf   = e => [e.ts, e.farm || '', e.turbine || '', e.type || '', e.text || e.subject || ''].join('|');\n\nconst today   = parsed.date;\nconst status  = decode(stRes) || { farms: {} };\nconst history = decode(hiRes) || { date: today, events: [] };\n\nconst seen = new Set(history.events.map(e => e.id));\nconst fresh = [];\n\nfor (const ev of parsed.events) {\n  const id = idOf(ev);\n  if (seen.has(id)) continue;           // already processed (retry / re-poll)\n  seen.add(id);\n  fresh.push({ id, ...ev });\n}\n\nconst blankDay = date => ({ date, faults: 0, warnings: 0, clears: 0, onsets: 0 });\n\nfor (const ev of fresh) {\n  if (ev.unparsed) continue;\n\n  const farm = (status.farms[ev.farm] ||= { name: ev.farmName, turbines: {} });\n  const t = (farm.turbines[ev.turbine] ||= {\n    state: 'ok', since: null, code: null, text: null,\n    lastEvent: null, lastCleared: null, today: blankDay(dayOf(ev.ts)), intermittent: false,\n  });\n\n  const evDay = dayOf(ev.ts);\n  if (t.today.date !== evDay) t.today = blankDay(evDay);\n\n  if (ev.type === 'clear') {\n    if (t.state !== 'ok') {\n      t.lastCleared = ev.ts;\n      // keep the finished episode so the screen can say \"down 08:02 → 10:15 (-10 Comms lost)\"\n      t.lastEpisode = { from: t.since, to: ev.ts, state: t.state, code: t.code, text: t.text };\n    }\n    t.state = 'ok';\n    t.since = null;\n    t.today.clears++;\n  } else {\n    if (t.state === 'ok') { t.since = ev.ts; t.today.onsets++; }    // new episode\n    if (ev.type === 'fault') { t.state = 'fault'; t.today.faults++; }\n    else { if (t.state !== 'fault') t.state = 'warning'; t.today.warnings++; }\n    t.code = ev.code;\n    t.text = ev.text;\n  }\n\n  t.lastEvent = ev.ts;\n  if (ev.serial) t.serial = ev.serial;\n  t.intermittent = t.today.onsets >= RULES.intermittentAlarms\n                || (t.today.faults + t.today.warnings) >= RULES.intermittentAlarms;\n}\n\n// Roll over day counters for turbines that haven't had an event today\nfor (const farm of Object.values(status.farms))\n  for (const t of Object.values(farm.turbines))\n    if (t.today.date !== today) { t.today = blankDay(today); t.intermittent = false; }\n\nstatus.updated = new Date().toISOString();\nstatus.date = today;\nhistory.events.push(...fresh);\n\nconst summary = fresh.filter(e => !e.unparsed).map(e => `${e.farm}/${e.turbine} ${e.type}`).join(', ') || 'unparsed alert';\nconst message = `alerts: ${summary}`.slice(0, 120);\nconst commit = (path, obj, sha) => ({\n  json: {\n    path,\n    body: { message, content: encode(obj), branch: parsed.branch, ...(sha ? { sha } : {}) },\n  },\n});\n\nif (!fresh.length) return [];   // nothing new -> nothing to commit\n\nreturn [\n  commit('data/status.json', status, stRes.sha),\n  commit(`data/history/${today}.json`, history, hiRes.sha),\n];\n"
+      }
+    },
+    {
+      "id": "commit-file",
+      "name": "Commit File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.github.com/repos/{{ $('Parse Emails').first().json.repo }}/contents/{{ $json.path }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "User-Agent",
+              "value": "n8n-turbine-status"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "New Alert Email (Outlook)": {
+      "main": [
+        [
+          {
+            "node": "Parse Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Alert Email (IMAP)": {
+      "main": [
+        [
+          {
+            "node": "Parse Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Emails": {
+      "main": [
+        [
+          {
+            "node": "Has Events?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Events?": {
+      "main": [
+        [
+          {
+            "node": "Get Status File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Get Status File": {
+      "main": [
+        [
+          {
+            "node": "Get History File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get History File": {
+      "main": [
+        [
+          {
+            "node": "Apply Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Events": {
+      "main": [
+        [
+          {
+            "node": "Commit File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Dublin"
+  }
+}

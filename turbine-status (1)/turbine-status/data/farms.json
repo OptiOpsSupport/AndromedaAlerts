@@ -1,0 +1,6 @@
+{
+  "_comment": "Farm ID (the PARK name lowercased, e.g. Bealhill -> bealhill) -> display name, map position, turbine count. Coordinates are placeholders.",
+  "farms": {
+    "bealhill": { "name": "Bealhill", "lat": 53.98, "lon": -7.36, "turbines": 10 }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "_comment": "Login name (lowercase) -> wind farm IDs they can see. \"*\" = all farms.",
+  "users": {
+    "sean":  { "displayName": "Seán",  "farms": ["*"] },
+    "john":  { "displayName": "John",  "farms": ["bealhill"] },
+    "aoife": { "displayName": "Aoife", "farms": ["bealhill"] }
+  }
+}
